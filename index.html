@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MtgPrint Multilanguage</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<style>
+:root{color-scheme:light dark;--bg:#f6f4ef;--fg:#1d1b18;--card:#fff;--line:#d8d3c8;--acc:#6b3fa0;--accfg:#fff;--mut:#6c675d}
+@media(prefers-color-scheme:dark){:root{--bg:#161512;--fg:#ece8df;--card:#211f1b;--line:#3a362f;--acc:#a37ad6;--accfg:#161512;--mut:#9a948a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif}
+main{max-width:1350px;margin:0 auto;padding:28px 18px 60px}
+h1{font-size:1.6rem;margin:0 0 4px}
+p.sub{margin:0 0 20px;color:var(--mut)}
+textarea{width:100%;height:320px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);font:14px/1.45 ui-monospace,monospace;resize:vertical}
+.row{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:14px 0}
+select,label{font-size:.95rem}
+select{padding:6px 8px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
+button{padding:12px 22px;border:0;border-radius:10px;background:var(--acc);color:var(--accfg);font-size:1rem;font-weight:600;cursor:pointer}
+button.sec{background:transparent;color:var(--fg);border:1px solid var(--line)}
+.grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-top:18px}
+@media(max-width:1300px){.grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media(max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.tile{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px;font-size:.85rem}
+.tile img{width:100%;aspect-ratio:63/88;object-fit:contain;border-radius:8px;background:var(--line);display:block;margin-bottom:6px}
+.iw{position:relative;cursor:pointer;margin-bottom:6px;user-select:none;-webkit-user-select:none}
+.iw img{margin:0}
+.qb{position:absolute;top:6px;right:6px;min-width:34px;text-align:center;padding:2px 8px;border-radius:999px;background:var(--acc);color:var(--accfg);font-weight:700;font-size:.9rem;pointer-events:none;box-shadow:0 1px 4px rgba(0,0,0,.4)}
+.hv{position:absolute;left:50%;transform:translate(-50%,-50%);font:700 5rem/1 system-ui,sans-serif;color:#fff;text-shadow:0 0 6px #000,0 0 14px #000;opacity:.2;pointer-events:none;display:none}
+.iw:hover .hv{display:block}
+.tile b{display:block;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tile select{width:100%;min-width:0;font-size:.75rem}
+button:disabled{opacity:.5;cursor:default}
+progress{width:100%;height:14px;margin-top:6px}
+#log{margin-top:12px;max-height:220px;overflow:auto;font:13px/1.5 ui-monospace,monospace;color:var(--mut);white-space:pre-wrap}
+.warn{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:10px 14px;font-size:.9rem;margin-bottom:18px;display:none}
+</style>
+</head>
+<body>
+<main>
+<h1>MtgPrint Multilanguage</h1>
+<p class="sub">Incolla la lista del mazzo. Clicca sulla metà alta di una carta per aggiungere una copia, sulla metà bassa per toglierne una.</p>
+<textarea id="deck" spellcheck="false">mountain
+plains
+forest
+swamp
+island</textarea>
+<div class="row">
+  <label>Lingua carte
+    <select id="lang"><option value="en">Inglese</option><option value="it">Italiano</option><option value="es">Spagnolo</option><option value="fr">Francese</option><option value="de">Tedesco</option><option value="pt">Portoghese</option></select>
+  </label>
+  <label>Qualità immagini
+    <select id="qual"><option value="normal">Normale (~200 dpi)</option><option value="large">Alta (~270 dpi, file più pesante)</option></select>
+  </label>
+  <label>Formato foglio
+    <select id="fmt"><option value="a4">A4</option><option value="letter">Letter</option></select>
+  </label>
+  <label><input type="checkbox" id="marks" checked> Segni di taglio</label>
+  <label><input type="checkbox" id="lands" checked> Includi terre base</label></div>
+<div class="row"><button id="go">Genera PDF</button><button id="loadLast" class="sec" type="button" disabled>Carica ultimo mazzo</button></div>
+<div id="prints" class="grid"></div>
+<progress id="bar" value="0" max="1" hidden></progress>
+<div id="log"></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const log = t => { $('log').textContent += t + '\n'; $('log').scrollTop = 1e9; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+// Scryfall accetta ~10 richieste al secondo sulle API: le distanziamo di 120 ms e riproviamo se rifiuta (429)
+let nextSlot = 0;
+async function sfetch(url, opts) {
+  for (let a = 0; a < 4; a++) {
+    const slot = Math.max(Date.now(), nextSlot);
+    nextSlot = slot + 120;
+    const wait = slot - Date.now();
+    if (wait > 0) await sleep(wait);
+    try {
+      const r = await fetch(url, opts);
+      if (r.status === 429) { nextSlot = Math.max(nextSlot, Date.now() + 2000 * (a + 1)); continue; }
+      return r;
+    } catch (e) {
+      if (a === 3) throw e;
+      await sleep(2000 * (a + 1));
+    }
+  }
+  throw new Error('Troppe richieste a Scryfall, riprova tra poco');
+}
+const BASIC = new Set(['plains','island','swamp','mountain','forest']);
+if (location.protocol !== 'file:' && !/^https?:$/.test(location.protocol)) $('warn').style.display = 'block';
+
+function parse(text, withLands) {
+  const out = [];
+  for (const raw of text.split('\n')) {
+    const l = raw.trim();
+    if (!l || /^(deck|sideboard|commander|\/\/)/i.test(l)) continue;
+    const m = l.match(/^(?:(\d+)x?\s+)?(.+?)(?:\s+\([A-Za-z0-9]+\)(?:\s+\S+)?)?$/);
+    if (!m) continue;
+    const name = m[2].trim();
+    if (!withLands && BASIC.has(name.toLowerCase())) continue;
+    out.push({ name, qty: parseInt(m[1] || '1', 10) });
+  }
+  return out;
+}
+
+const cname = {};
+const picks = {};
+const chosen = {}; // stampe scelte a mano dall'utente (nome carta -> id Scryfall), sopravvivono agli aggiornamenti
+function resetPrints() { for (const k in picks) delete picks[k]; $('prints').innerHTML = ''; }
+const thumb = c => ((c.image_uris || c.card_faces[0].image_uris) || {}).normal;
+
+// aggiornamento automatico delle stampe: parte 700 ms dopo l'ultima modifica; una nuova modifica annulla il caricamento in corso
+let runTok = 0, debounce;
+function schedulePrints() {
+  runTok++; resetPrints();
+  clearTimeout(debounce);
+  debounce = setTimeout(loadPrints, 700);
+}
+// ultimo mazzo salvato nel browser (localStorage)
+const LAST_KEY = 'mtgprint_last_deck';
+const readLast = () => { try { return localStorage.getItem(LAST_KEY) || ''; } catch (e) { return ''; } };
+function saveLast() {
+  const v = $('deck').value;
+  if (!v.trim()) return;
+  try { localStorage.setItem(LAST_KEY, v); } catch (e) {}
+  $('loadLast').disabled = false;
+}
+$('loadLast').disabled = !readLast();
+$('loadLast').onclick = () => {
+  const v = readLast();
+  if (!v) return;
+  $('deck').value = v;
+  schedulePrints();
+};
+let saveT;
+$('deck').oninput = () => { schedulePrints(); clearTimeout(saveT); saveT = setTimeout(saveLast, 1000); };
+$('lang').onchange = schedulePrints;
+$('lands').onchange = schedulePrints;
+
+// quantità per carta: mostrate come badge sulle tile e modificate direttamente nel testo della lista
+function refreshBadges() {
+  const tot = {};
+  for (const d of parse($('deck').value, true)) { const k = d.name.toLowerCase(); tot[k] = (tot[k] || 0) + d.qty; }
+  document.querySelectorAll('.tile').forEach(t => {
+    const q = tot[t.dataset.name.toLowerCase()] || 0;
+    t.querySelector('.qb').textContent = '×' + q;
+    t.querySelector('img').style.opacity = q ? 1 : .35;
+  });
+}
+function adjustQty(name, delta) {
+  const ta = $('deck'), key = name.toLowerCase();
+  const lines = ta.value.split('\n'), drop = new Set();
+  let total = 0, first = -1;
+  lines.forEach((raw, i) => {
+    const l = raw.trim();
+    if (!l || /^(deck|sideboard|commander|\/\/)/i.test(l)) return;
+    const m = l.match(/^(?:(\d+)x?\s+)?(.+?)(?:\s+\([A-Za-z0-9]+\)(?:\s+\S+)?)?$/);
+    if (!m || m[2].trim().toLowerCase() !== key) return;
+    total += parseInt(m[1] || '1', 10);
+    if (first < 0) first = i; else drop.add(i); // righe duplicate della stessa carta: unite in una sola
+  });
+  if (first < 0) return;
+  const q = Math.max(0, total + delta);
+  if (q === total && !drop.size) return;
+  lines[first] = q + ' ' + lines[first].trim().replace(/^\d+x?\s+/, '');
+  const st = ta.scrollTop;
+  ta.value = lines.filter((_, i) => !drop.has(i)).join('\n');
+  ta.scrollTop = st;
+  refreshBadges();
+  clearTimeout(saveT); saveT = setTimeout(saveLast, 1000);
+}
+
+async function loadPrints() {
+  const tok = ++runTok;
+  resetPrints();
+  const lang = $('lang').value;
+  const names = [...new Set(parse($('deck').value, $('lands').checked).map(d => d.name))];
+  const tiles = names.map(n => {
+    const t = document.createElement('div'); t.className = 'tile';
+    t.innerHTML = '<div class="iw" title="Metà alta: +1 copia · metà bassa: −1 copia"><img alt=""><span class="hv"></span><span class="qb"></span></div><b></b><select disabled><option>Carico…</option></select>';
+    t.dataset.name = n;
+    t.querySelector('b').textContent = n; t.querySelector('b').title = n;
+    const iw = t.querySelector('.iw'), hv = t.querySelector('.hv');
+    // in sovrimpressione compare + (metà alta) o − (metà bassa), al 20% di opacità
+    iw.onmousemove = e => {
+      const r = iw.getBoundingClientRect(), up = e.clientY < r.top + r.height / 2;
+      hv.textContent = up ? '+' : '−';
+      hv.style.top = up ? '25%' : '75%';
+    };
+    iw.onclick = e => {
+      const r = e.currentTarget.getBoundingClientRect();
+      adjustQty(n, e.clientY < r.top + r.height / 2 ? 1 : -1);
+    };
+    $('prints').appendChild(t); return t;
+  });
+  refreshBadges();
+  const JSONH = { headers: { 'Accept': 'application/json' } };
+  const SPECIAL = '(set:unh or set:und or set:unf or set:ust)';
+  // stampe Unhinged/Unsanctioned/Unfinity/Unstable: una sola ricerca ogni 12 carte invece di una per carta
+  const special = {};
+  const specialP = (async () => {
+    for (let i = 0; i < names.length; i += 12) {
+      if (tok !== runTok) return;
+      const chunk = names.slice(i, i + 12);
+      const q = '(' + chunk.map(n => '!"' + n.split('//')[0].trim() + '"').join(' or ') + ') ' + SPECIAL;
+      let u = 'https://api.scryfall.com/cards/search?unique=prints&include_extras=true&include_variations=true&order=set&dir=asc&q=' + encodeURIComponent(q);
+      for (let pg = 0; u && pg < 6; pg++) {
+        try {
+          const r = await sfetch(u, JSONH);
+          if (!r.ok) break;
+          const j = await r.json();
+          for (const c of j.data) {
+            if (!imgOf(c)) continue;
+            const key = front(c.name);
+            (special[key] = special[key] || []).push(c);
+          }
+          u = j.has_more ? j.next_page : null;
+        } catch (e) { break; }
+      }
+    }
+  })();
+  const loadOne = async i => {
+    const n = names[i], t = tiles[i], sel = t.querySelector('select'), img = t.querySelector('img');
+    try {
+      const base = '!"' + n.split('//')[0].trim() + '"';
+      const search = async L => {
+        const r = await sfetch('https://api.scryfall.com/cards/search?unique=prints&include_multilingual=true&order=released&dir=desc&q=' + encodeURIComponent(base + ' lang:' + L), JSONH);
+        return r.ok ? (await r.json()).data.filter(c => c.lang === L && imgOf(c)) : [];
+      };
+      // stampe nella lingua scelta; se non ce ne sono, ripiega sull'inglese. Se la lista non è inglese, in fondo vanno sempre 2 stampe inglesi (le più recenti)
+      let data = await search(lang);
+      if (lang !== 'en') {
+        const en = await search('en');
+        data = data.length ? [...data, ...en.slice(0, 2)] : en;
+      }
+      await specialP;
+      if (tok !== runTok) return;
+      if (!data.length) throw new Error('vuoto');
+      // in cima: tutte le stampe speciali, duplicati compresi (es. terre base con più illustrazioni)
+      const sp = (special[front(n)] || []).slice().sort((a, b) => (b.set === 'ust') - (a.set === 'ust')); // Unstable per prima, se esiste
+      if (sp.length) data = [...sp, ...data.filter(x => !sp.some(s => s.id === x.id))];
+      sel.innerHTML = '';
+      data.forEach((c, k) => {
+        const o = document.createElement('option'); o.value = k;
+        o.textContent = c.set_name + ' (' + c.set.toUpperCase() + ') #' + c.collector_number + ' · ' + c.lang.toUpperCase() + ' · ' + c.released_at.slice(0, 4);
+        sel.appendChild(o);
+      });
+      // se l'utente aveva già scelto una stampa di questa carta, la ripristina (se ancora disponibile nella lingua attuale)
+      const prev = data.findIndex(c => c.id === chosen[n]);
+      const d = prev >= 0 ? prev : 0;
+      sel.value = d; picks[n] = data[d]; img.src = thumb(data[d]); sel.disabled = false;
+      sel.onchange = () => { picks[n] = data[+sel.value]; chosen[n] = picks[n].id; img.src = thumb(picks[n]); };
+    } catch (e) {
+      if (tok === runTok) sel.innerHTML = '<option>Nessuna stampa trovata</option>';
+    }
+  };
+  // 5 carte in parallelo: il limitatore di sfetch tiene comunque il ritmo sotto il limite di Scryfall
+  let next = 0;
+  await Promise.all(Array.from({ length: 5 }, async () => {
+    while (next < names.length && tok === runTok) await loadOne(next++);
+  }));
+}
+
+const front = n => n.split('//')[0].trim().toLowerCase();
+const imgOf = c => {
+  const Q = $('qual').value;
+  if (c.image_uris) return [c.image_uris[Q]];
+  const f = (c.card_faces || []).filter(x => x.image_uris).map(x => x.image_uris[Q]);
+  return f.length ? f : null;
+};
+const matches = (c, n) => c.name.toLowerCase() === n.toLowerCase() || front(c.name) === front(n);
+
+async function collection(queries) {
+  const found = [];
+  for (let i = 0; i < queries.length; i += 75) {
+    const chunk = queries.slice(i, i + 75);
+    const r = await sfetch('https://api.scryfall.com/cards/collection', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ identifiers: chunk.map(name => ({ name })) })
+    });
+    if (!r.ok) throw new Error('Scryfall ha risposto ' + r.status);
+    found.push(...(await r.json()).data);
+  }
+  return found;
+}
+
+async function fetchUrls(names) {
+  const urls = {};
+  const apply = (data, list) => {
+    for (const n of list) {
+      if (urls[n]) continue;
+      const c = data.find(c => matches(c, n));
+      if (c && imgOf(c)) { urls[n] = imgOf(c); cname[n] = c.name; }
+    }
+  };
+  // 1) nome completo
+  apply(await collection(names), names);
+  // 2) carte con // non trovate: solo nome della prima faccia
+  let missing = names.filter(n => !urls[n]);
+  if (missing.length) {
+    const fronts = missing.map(n => n.split('//')[0].trim());
+    apply(await collection(fronts), missing);
+  }
+  // 3) ultimo tentativo: ricerca fuzzy una per una
+  missing = names.filter(n => !urls[n]);
+  for (const n of missing) {
+    try {
+      const r = await sfetch('https://api.scryfall.com/cards/named?fuzzy=' + encodeURIComponent(n.split('//')[0].trim()), { headers: { 'Accept': 'application/json' } });
+      if (r.ok) { const c = await r.json(); if (imgOf(c)) { urls[n] = imgOf(c); cname[n] = c.name; } }
+    } catch (e) {}
+  }
+  return urls;
+}
+
+async function localize(names, urls, lang) {
+  const list = names.filter(n => cname[n]);
+  const got = {};
+  for (let i = 0; i < list.length; i += 15) {
+    const chunk = list.slice(i, i + 15);
+    const q = '(' + chunk.map(n => '!"' + cname[n].replace(/"/g, '') + '"').join(' or ') + ') lang:' + lang;
+    let url = 'https://api.scryfall.com/cards/search?unique=prints&order=released&dir=desc&q=' + encodeURIComponent(q);
+    for (let pg = 0; url && pg < 4; pg++) {
+      try {
+        const r = await sfetch(url, { headers: { 'Accept': 'application/json' } });
+        if (!r.ok) break;
+        const j = await r.json();
+        for (const c of j.data) if (!got[c.name] && imgOf(c)) got[c.name] = imgOf(c);
+        url = j.has_more ? j.next_page : null;
+      } catch (e) { break; }
+    }
+  }
+  for (const n of list) {
+    if (got[cname[n]]) { urls[n] = got[cname[n]]; log('Lingua OK: ' + n); }
+    else log('Solo inglese: ' + n);
+  }
+}
+
+function toDataURL(url) {
+  return fetch(url).then(r => { if (!r.ok) throw new Error(r.status); return r.blob(); })
+    .then(b => new Promise((res, rej) => { const f = new FileReader(); f.onload = () => res(f.result); f.onerror = rej; f.readAsDataURL(b); }));
+}
+
+$('go').onclick = async () => {
+  const btn = $('go'); btn.disabled = true; $('log').textContent = '';
+  try {
+    const deck = parse($('deck').value, $('lands').checked);
+    if (!deck.length) throw new Error('Lista vuota.');
+    saveLast();
+    const names = deck.map(d => d.name);
+    log('Carte uniche: ' + names.length);
+    const bar = $('bar'); bar.hidden = false; bar.max = names.length + 1; bar.value = 0;
+    const todo = names.filter(n => !picks[n]);
+    const urls = todo.length ? await fetchUrls(todo) : {};
+    for (const n in picks) urls[n] = imgOf(picks[n]);
+    bar.value = 1;
+    if ($('lang').value !== 'en') { log('Cerco le stampe in lingua (' + $('lang').value + ')…'); await localize(todo, urls, $('lang').value); }
+    const imgs = {};
+    const queue = [...new Set(names)];
+    const worker = async () => {
+      while (queue.length) {
+        const n = queue.shift();
+        if (!urls[n]) { log('NON TROVATA: ' + n); bar.value++; continue; }
+        try {
+          const list = urls[n]; // le carte a doppia faccia stampano sempre fronte e retro
+          imgs[n] = await Promise.all(list.map(toDataURL));
+          log('OK  ' + n + (list.length > 1 ? ' (fronte + retro)' : ''));
+        }
+        catch (e) { log('ERRORE immagine: ' + n); }
+        bar.value++;
+      }
+    };
+    await Promise.all(Array.from({ length: 8 }, worker));
+    const [PW, PH] = $('fmt').value === 'a4' ? [210, 297] : [215.9, 279.4];
+    const W = 63, H = 88, ox = (PW - 3 * W) / 2, oy = (PH - 3 * H) / 2;
+    const doc = new jspdf.jsPDF({ unit: 'mm', format: [PW, PH] });
+    const cards = deck.flatMap(d => Array(d.qty).fill(0).flatMap(() => (imgs[d.name] && imgs[d.name].length ? imgs[d.name].map((_, f) => ({ n: d.name, f })) : [{ n: d.name, f: 0 }])));
+    if (!cards.length) throw new Error('Nessuna carta da stampare (tutte le quantità sono 0).');
+    for (let p = 0; p < cards.length; p += 9) {
+      if (p) doc.addPage();
+      cards.slice(p, p + 9).forEach(({ n, f }, j) => {
+        const x = ox + (j % 3) * W, y = oy + Math.floor(j / 3) * H;
+        if (imgs[n] && imgs[n][f]) doc.addImage(imgs[n][f], 'JPEG', x, y, W, H);
+        else {
+          doc.setDrawColor(150); doc.setLineWidth(.2); doc.rect(x, y, W, H);
+          doc.setFont('helvetica', 'bold'); doc.setFontSize(14); doc.setTextColor(0);
+          const lines = doc.splitTextToSize(n, W - 14);
+          doc.text(lines, x + W / 2, y + H / 2 - (lines.length - 1) * 3, { align: 'center' });
+        }
+      });
+      if ($('marks').checked) {
+        // 1) segni a bordo foglio: dal bordo della pagina fino a 1 mm dalla griglia, su ogni linea di taglio
+        doc.setDrawColor(0); doc.setLineWidth(.15);
+        for (let k = 0; k < 4; k++) {
+          const xx = ox + k * W, yy = oy + k * H;
+          doc.line(xx, 0, xx, oy - 1); doc.line(xx, oy + 3 * H + 1, xx, PH);
+          doc.line(0, yy, ox - 1, yy); doc.line(ox + 3 * W + 1, yy, PW, yy);
+        }
+        // 2) crocette sugli incroci interni (angoli tra le carte), in grigio chiaro per vedersi anche sui bordi neri
+        doc.setDrawColor(170); doc.setLineWidth(.2);
+        const L = 3;
+        // 3) prosecuzione in bianco dei segni di bordo dentro le carte, per 3 mm
+        doc.setDrawColor(255); doc.setLineWidth(.2);
+        for (let k = 0; k < 4; k++) {
+          const xx = ox + k * W, yy = oy + k * H;
+          doc.line(xx, oy, xx, oy + L); doc.line(xx, oy + 3 * H - L, xx, oy + 3 * H);
+          doc.line(ox, yy, ox + L, yy); doc.line(ox + 3 * W - L, yy, ox + 3 * W, yy);
+        }
+        doc.setDrawColor(170);
+        for (let i = 1; i < 3; i++) for (let j = 1; j < 3; j++) {
+          const xx = ox + i * W, yy = oy + j * H;
+          doc.line(xx - L, yy, xx + L, yy); doc.line(xx, yy - L, xx, yy + L);
+        }
+      }
+    }
+    doc.save('Deck.pdf');
+    log('Fatto: ' + cards.length + ' carte, ' + Math.ceil(cards.length / 9) + ' pagine.');
+  } catch (e) {
+    log('Errore: ' + e.message);
+  } finally { btn.disabled = false; }
+};
+
+// caricamento iniziale delle stampe per il mazzo già presente
+schedulePrints();
+</script>
+</body>
+</html>
