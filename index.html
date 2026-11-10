@@ -72,7 +72,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // invece di restituire la risposta. Ogni errore di rete viene quindi trattato come un 429 e mette in pausa TUTTE le richieste.
 let nextSlot = 0, penalty = 0;
 async function sfetch(url, opts) {
-  for (let a = 0; a < 6; a++) {
+  for (let a = 0; a < 4; a++) {
     const slot = Math.max(Date.now(), nextSlot);
     nextSlot = slot + 200 + penalty; // ~5 richieste al secondo (più lento se siamo stati rifiutati)
     const wait = slot - Date.now();
@@ -87,7 +87,7 @@ async function sfetch(url, opts) {
     }
     if (limited) {
       penalty = Math.min(600, penalty + 100);
-      nextSlot = Math.max(nextSlot, Date.now() + 4000 * (a + 1)); // pausa globale: blocca anche gli altri worker
+      nextSlot = Math.max(nextSlot, Date.now() + 3000 * (a + 1)); // pausa globale: blocca anche gli altri worker
     }
   }
   throw new Error('Troppe richieste a Scryfall, riprova tra poco');
@@ -96,11 +96,14 @@ const searchCache = {}; // url -> risultati già scaricati (evita di rifare le s
 const BASIC = new Set(['plains','island','swamp','mountain','forest']);
 if (location.protocol !== 'file:' && !/^https?:$/.test(location.protocol)) $('warn').style.display = 'block';
 
+// nessun nome di carta contiene questi caratteri o è così lungo: evitiamo di mandare a Scryfall query assurde (che rifiuta con 403)
+const isJunk = l => /[<>{}=;]|https?:|\/\*/.test(l) || l.length > 120;
 function parse(text, withLands) {
   const out = [];
   for (const raw of text.split('\n')) {
     const l = raw.trim();
     if (!l || /^(deck|sideboard|commander|\/\/)/i.test(l)) continue;
+    if (isJunk(l)) continue; // righe che non possono essere nomi di carte (es. codice HTML incollato per errore)
     const m = l.match(/^(?:(\d+)x?\s+)?(.+?)(?:\s+\([A-Za-z0-9]+\)(?:\s+\S+)?)?$/);
     if (!m) continue;
     const name = m[2].trim();
@@ -117,7 +120,7 @@ function resetPrints() { for (const k in picks) delete picks[k]; $('prints').inn
 const thumb = c => ((c.image_uris || c.card_faces[0].image_uris) || {}).normal;
 
 // aggiornamento automatico delle stampe: parte 700 ms dopo l'ultima modifica; una nuova modifica annulla il caricamento in corso
-let runTok = 0, debounce;
+let runTok = 0, debounce, genRunning = false;
 function schedulePrints() {
   runTok++; resetPrints();
   clearTimeout(debounce);
@@ -231,6 +234,8 @@ async function loadPrints() {
     $('prints').appendChild(t); return t;
   });
   refreshBadges();
+  const junk = $('deck').value.split('\n').map(s => s.trim()).filter(l => l && isJunk(l));
+  if (junk.length) log('Ignorate ' + junk.length + ' righe che non sembrano carte (es. "' + junk[0].slice(0, 60) + '…"). Controlla la lista.');
   log('Carico le anteprime…');
 
   const front0 = n => n.split('//')[0].trim().replace(/"/g, '');
@@ -258,8 +263,9 @@ async function loadPrints() {
   // stampa mostrata di default: scelta dell'utente > stampe speciali (Unstable per prima) > più recente nella lingua > anteprima di ripiego
   const fillTile = i => {
     const n = names[i], t = tiles[i];
-    if (t.dataset.full) return;
+    if (t.dataset.full || t.dataset.busy) return;
     const k = front(n), sel = t.querySelector('select'), img = t.querySelector('img');
+    if (document.activeElement === sel && sel.options.length > 0 && !sel.disabled && img.dataset.id) return; // non disturbare chi sta usando il menu
     const ch = chosen[n];
     let c = null;
     if (ch && (ch.lang === lang || SPECIAL_SETS.has(ch.set))) c = ch;
@@ -275,13 +281,8 @@ async function loadPrints() {
   const fillAll = () => { if (alive()) names.forEach((_, i) => fillTile(i)); };
   fillAll(); // ciò che è già in cache appare subito
 
-  // 1) stampe speciali (una ricerca ogni 12 carte)
-  const needSp = names.filter(n => !specialDone.has(front(n)));
-  await searchGroup(needSp, '(set:unh or set:und or set:unf or set:ust)', 'include_extras=true&include_variations=true&order=set&dir=asc', 12, 6,
-    c => { if (imgOf(c)) (specialCache[front(c.name)] = specialCache[front(c.name)] || []).push(c); },
-    ch => ch.forEach(n => specialDone.add(front(n))));
-  fillAll();
-  // 2) stampa più recente nella lingua scelta: terre base una per una (hanno centinaia di stampe), le altre a gruppi di 8
+  // FASE 1 (priorità assoluta): solo l'immagine di default di ogni carta, così l'utente vede subito tutto.
+  // stampa più recente nella lingua scelta: terre base una per una (hanno centinaia di stampe), le altre a gruppi di 8
   const needLoc = names.filter(n => !locDone[lang].has(front(n)));
   const onLoc = c => { if (c.lang !== lang || !imgOf(c)) return; const k = front(c.name); if (!locCache[lang][k]) locCache[lang][k] = c; };
   const markLoc = ch => ch.forEach(n => locDone[lang].add(front(n)));
@@ -302,17 +303,33 @@ async function loadPrints() {
   fillAll();
   if (!alive()) return;
   tiles.forEach(t => { const s = t.querySelector('select'); if (s.disabled) s.innerHTML = '<option>Nessuna stampa trovata</option>'; });
-  log('Anteprime pronte. Apri il menu di una carta per scegliere un\'altra stampa.');
+  log('Immagini pronte. Carico in background le altre stampe…');
 
-  // elenco completo delle stampe di una singola carta (una o due richieste, solo su richiesta)
-  async function populate(i) {
+  // FASE 2 (background): stampe speciali (Unstable ecc.), che sostituiscono l'immagine di default solo per le carte che le hanno
+  const bgOk = () => alive() && !genRunning;
+  const needSp = names.filter(n => !specialDone.has(front(n)));
+  await searchGroup(needSp, '(set:unh or set:und or set:unf or set:ust)', 'include_extras=true&include_variations=true&order=set&dir=asc', 12, 6,
+    c => { if (imgOf(c)) (specialCache[front(c.name)] = specialCache[front(c.name)] || []).push(c); },
+    ch => ch.forEach(n => specialDone.add(front(n))));
+  fillAll();
+  // FASE 3 (background): elenco completo delle stampe di ogni carta, una alla volta; si ferma se cambi lista/lingua o premi "Genera PDF"
+  for (let i = 0; i < names.length && bgOk(); i++) {
+    if (!tiles[i].dataset.full) await populate(i);
+  }
+  if (bgOk()) log('Tutte le stampe caricate.');
+
+  // elenco completo delle stampe di una singola carta (una o due richieste); se è già in corso restituisce la stessa promessa
+  function populate(i) {
+    const t = tiles[i];
+    if (!t._p) t._p = populateInner(i).finally(() => { t._p = null; });
+    return t._p;
+  }
+  async function populateInner(i) {
     const n = names[i], t = tiles[i], sel = t.querySelector('select'), img = t.querySelector('img');
-    if (t.dataset.busy) return false;
     t.dataset.busy = '1';
-    const hadFocus = document.activeElement === sel; // un select disabilitato perde il focus: lo ripristiniamo a fine caricamento
     let okLoad = false;
     const prevHtml = sel.innerHTML;
-    sel.disabled = true; sel.innerHTML = '<option>Carico le stampe…</option>';
+    sel.style.cursor = 'progress'; // il menu resta utilizzabile (e con il focus) mentre carica
     try {
       const base = '!"' + front0(n) + '"';
       const search = async L => {
@@ -341,9 +358,8 @@ async function loadPrints() {
       sel.innerHTML = prevHtml;
       log('Impossibile caricare le stampe di ' + n + ': ' + e.message);
     }
-    sel.disabled = false;
+    sel.style.cursor = '';
     delete t.dataset.busy;
-    if (okLoad && hadFocus) sel.focus();
     return okLoad;
   }
 }
@@ -429,7 +445,7 @@ function toDataURL(url) {
 }
 
 $('go').onclick = async () => {
-  const btn = $('go'); btn.disabled = true; $('log').textContent = '';
+  const btn = $('go'); btn.disabled = true; $('log').textContent = ''; genRunning = true; // ferma il caricamento in background
   try {
     const deck = parse($('deck').value, $('lands').checked);
     if (!deck.length) throw new Error('Lista vuota.');
@@ -504,7 +520,7 @@ $('go').onclick = async () => {
     log('Fatto: ' + cards.length + ' carte, ' + Math.ceil(cards.length / 9) + ' pagine.');
   } catch (e) {
     log('Errore: ' + e.message);
-  } finally { btn.disabled = false; }
+  } finally { btn.disabled = false; genRunning = false; }
 };
 
 // caricamento iniziale delle stampe per il mazzo già presente
