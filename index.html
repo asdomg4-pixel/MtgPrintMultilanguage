@@ -68,24 +68,31 @@ const $ = id => document.getElementById(id);
 const log = t => { $('log').textContent += t + '\n'; $('log').scrollTop = 1e9; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 // Scryfall accetta ~10 richieste al secondo sulle API: le distanziamo di 120 ms e riproviamo se rifiuta (429)
-let nextSlot = 0;
+// Nota: quando Scryfall risponde 429 NON invia gli header CORS, quindi il browser lancia un'eccezione (TypeError)
+// invece di restituire la risposta. Ogni errore di rete viene quindi trattato come un 429 e mette in pausa TUTTE le richieste.
+let nextSlot = 0, penalty = 0;
 async function sfetch(url, opts) {
-  for (let a = 0; a < 4; a++) {
+  for (let a = 0; a < 6; a++) {
     const slot = Math.max(Date.now(), nextSlot);
-    nextSlot = slot + 120;
+    nextSlot = slot + 200 + penalty; // ~5 richieste al secondo (più lento se siamo stati rifiutati)
     const wait = slot - Date.now();
     if (wait > 0) await sleep(wait);
+    let limited = false;
     try {
       const r = await fetch(url, opts);
-      if (r.status === 429) { nextSlot = Math.max(nextSlot, Date.now() + 2000 * (a + 1)); continue; }
-      return r;
+      if (r.status !== 429) { penalty = Math.max(0, penalty - 20); return r; }
+      limited = true;
     } catch (e) {
-      if (a === 3) throw e;
-      await sleep(2000 * (a + 1));
+      limited = true; // probabile 429 mascherato da errore CORS
+    }
+    if (limited) {
+      penalty = Math.min(600, penalty + 100);
+      nextSlot = Math.max(nextSlot, Date.now() + 4000 * (a + 1)); // pausa globale: blocca anche gli altri worker
     }
   }
   throw new Error('Troppe richieste a Scryfall, riprova tra poco');
 }
+const searchCache = {}; // url -> risultati già scaricati (evita di rifare le stesse ricerche cambiando lingua/terre)
 const BASIC = new Set(['plains','island','swamp','mountain','forest']);
 if (location.protocol !== 'file:' && !/^https?:$/.test(location.protocol)) $('warn').style.display = 'block';
 
@@ -105,7 +112,7 @@ function parse(text, withLands) {
 
 const cname = {};
 const picks = {};
-const chosen = {}; // stampe scelte a mano dall'utente (nome carta -> id Scryfall), sopravvivono agli aggiornamenti
+const chosen = {}; // stampe scelte a mano dall'utente (nome carta -> oggetto carta Scryfall), sopravvivono agli aggiornamenti
 function resetPrints() { for (const k in picks) delete picks[k]; $('prints').innerHTML = ''; }
 const thumb = c => ((c.image_uris || c.card_faces[0].image_uris) || {}).normal;
 
@@ -170,17 +177,28 @@ function adjustQty(name, delta) {
   clearTimeout(saveT); saveT = setTimeout(saveLast, 1000);
 }
 
+// Strategia anti-429: all'avvio poche richieste raggruppate (12 carte per ricerca) per le anteprime;
+// l'elenco completo delle stampe di una carta viene scaricato solo quando apri il suo menu a tendina.
+const SPECIAL_SETS = new Set(['unh', 'und', 'unf', 'ust']);
+const API = 'https://api.scryfall.com/cards/search';
+const JSONH = { headers: { 'Accept': 'application/json' } };
+const specialCache = {}, specialDone = new Set(); // chiave carta -> stampe speciali già cercate
+const locCache = {}, locDone = {};                // lingua -> chiave carta -> stampa più recente / carte già cercate
+const baseCache = {};                             // chiave carta -> stampa di ripiego (collection)
+const label = c => c.set_name + ' (' + c.set.toUpperCase() + ') #' + c.collector_number + ' · ' + c.lang.toUpperCase() + ' · ' + c.released_at.slice(0, 4);
+
 async function loadPrints() {
-  const tok = ++runTok;
+  const tok = ++runTok, alive = () => tok === runTok;
   resetPrints();
   const lang = $('lang').value;
+  locCache[lang] = locCache[lang] || {}; locDone[lang] = locDone[lang] || new Set();
   const names = [...new Set(parse($('deck').value, $('lands').checked).map(d => d.name))];
-  const tiles = names.map(n => {
+  const tiles = names.map((n, i) => {
     const t = document.createElement('div'); t.className = 'tile';
     t.innerHTML = '<div class="iw" title="Metà alta: +1 copia · metà bassa: −1 copia"><img alt=""><span class="hv"></span><span class="qb"></span></div><b></b><select disabled><option>Carico…</option></select>';
     t.dataset.name = n;
     t.querySelector('b').textContent = n; t.querySelector('b').title = n;
-    const iw = t.querySelector('.iw'), hv = t.querySelector('.hv');
+    const iw = t.querySelector('.iw'), hv = t.querySelector('.hv'), sel = t.querySelector('select');
     // in sovrimpressione compare + (metà alta) o − (metà bassa), al 20% di opacità
     iw.onmousemove = e => {
       const r = iw.getBoundingClientRect(), up = e.clientY < r.top + r.height / 2;
@@ -191,74 +209,143 @@ async function loadPrints() {
       const r = e.currentTarget.getBoundingClientRect();
       adjustQty(n, e.clientY < r.top + r.height / 2 ? 1 : -1);
     };
+    // elenco completo delle stampe: scaricato solo alla prima apertura del menu
+    sel.addEventListener('mousedown', async e => {
+      if (t.dataset.full || sel.disabled) return;
+      e.preventDefault();
+      await populate(i);
+      try { sel.showPicker(); } catch (err) {}
+    });
+    // da tastiera: se l'elenco non è ancora caricato, le frecce lo caricano e poi applicano lo spostamento, senza aprire il menu
+    sel.addEventListener('keydown', async e => {
+      if (t.dataset.full || sel.disabled || (e.key !== 'ArrowDown' && e.key !== 'ArrowUp')) return;
+      e.preventDefault();
+      if (!(await populate(i))) return;
+      const k = Math.max(0, Math.min(sel.options.length - 1, sel.selectedIndex + (e.key === 'ArrowDown' ? 1 : -1)));
+      if (k !== sel.selectedIndex) { sel.selectedIndex = k; sel.dispatchEvent(new Event('change')); }
+    });
+    // con Tab: se il menu resta selezionato per mezzo secondo, carica le stampe in anticipo (senza scaricarle mentre si scorre veloce)
+    let ft;
+    sel.addEventListener('focus', () => { clearTimeout(ft); ft = setTimeout(() => { if (document.activeElement === sel && !t.dataset.full && !sel.disabled) populate(i); }, 500); });
+    sel.addEventListener('blur', () => clearTimeout(ft));
     $('prints').appendChild(t); return t;
   });
   refreshBadges();
-  const JSONH = { headers: { 'Accept': 'application/json' } };
-  const SPECIAL = '(set:unh or set:und or set:unf or set:ust)';
-  // stampe Unhinged/Unsanctioned/Unfinity/Unstable: una sola ricerca ogni 12 carte invece di una per carta
-  const special = {};
-  const specialP = (async () => {
-    for (let i = 0; i < names.length; i += 12) {
-      if (tok !== runTok) return;
-      const chunk = names.slice(i, i + 12);
-      const q = '(' + chunk.map(n => '!"' + n.split('//')[0].trim() + '"').join(' or ') + ') ' + SPECIAL;
-      let u = 'https://api.scryfall.com/cards/search?unique=prints&include_extras=true&include_variations=true&order=set&dir=asc&q=' + encodeURIComponent(q);
-      for (let pg = 0; u && pg < 6; pg++) {
+  log('Carico le anteprime…');
+
+  const front0 = n => n.split('//')[0].trim().replace(/"/g, '');
+  // ricerca raggruppata: più carte per richiesta, con paginazione limitata
+  const searchGroup = async (list, suffix, extra, size, pages, onCard, onChunkDone) => {
+    for (let i = 0; i < list.length; i += size) {
+      if (!alive()) return;
+      const chunk = list.slice(i, i + size);
+      const q = '(' + chunk.map(n => '!"' + front0(n) + '"').join(' or ') + ') ' + suffix;
+      let u = API + '?unique=prints&' + extra + '&q=' + encodeURIComponent(q), ok = true;
+      for (let pg = 0; u && pg < pages; pg++) {
         try {
           const r = await sfetch(u, JSONH);
-          if (!r.ok) break;
+          if (r.status === 404) break; // nessun risultato: valido
+          if (!r.ok) { ok = false; break; }
           const j = await r.json();
-          for (const c of j.data) {
-            if (!imgOf(c)) continue;
-            const key = front(c.name);
-            (special[key] = special[key] || []).push(c);
-          }
+          j.data.forEach(onCard);
           u = j.has_more ? j.next_page : null;
-        } catch (e) { break; }
+        } catch (e) { ok = false; break; }
       }
-    }
-  })();
-  const loadOne = async i => {
-    const n = names[i], t = tiles[i], sel = t.querySelector('select'), img = t.querySelector('img');
-    try {
-      const base = '!"' + n.split('//')[0].trim() + '"';
-      const search = async L => {
-        const r = await sfetch('https://api.scryfall.com/cards/search?unique=prints&include_multilingual=true&order=released&dir=desc&q=' + encodeURIComponent(base + ' lang:' + L), JSONH);
-        return r.ok ? (await r.json()).data.filter(c => c.lang === L && imgOf(c)) : [];
-      };
-      // stampe nella lingua scelta; se non ce ne sono, ripiega sull'inglese. Se la lista non è inglese, in fondo vanno sempre 2 stampe inglesi (le più recenti)
-      let data = await search(lang);
-      if (lang !== 'en') {
-        const en = await search('en');
-        data = data.length ? [...data, ...en.slice(0, 2)] : en;
-      }
-      await specialP;
-      if (tok !== runTok) return;
-      if (!data.length) throw new Error('vuoto');
-      // in cima: tutte le stampe speciali, duplicati compresi (es. terre base con più illustrazioni)
-      const sp = (special[front(n)] || []).slice().sort((a, b) => (b.set === 'ust') - (a.set === 'ust')); // Unstable per prima, se esiste
-      if (sp.length) data = [...sp, ...data.filter(x => !sp.some(s => s.id === x.id))];
-      sel.innerHTML = '';
-      data.forEach((c, k) => {
-        const o = document.createElement('option'); o.value = k;
-        o.textContent = c.set_name + ' (' + c.set.toUpperCase() + ') #' + c.collector_number + ' · ' + c.lang.toUpperCase() + ' · ' + c.released_at.slice(0, 4);
-        sel.appendChild(o);
-      });
-      // se l'utente aveva già scelto una stampa di questa carta, la ripristina (se ancora disponibile nella lingua attuale)
-      const prev = data.findIndex(c => c.id === chosen[n]);
-      const d = prev >= 0 ? prev : 0;
-      sel.value = d; picks[n] = data[d]; img.src = thumb(data[d]); sel.disabled = false;
-      sel.onchange = () => { picks[n] = data[+sel.value]; chosen[n] = picks[n].id; img.src = thumb(picks[n]); };
-    } catch (e) {
-      if (tok === runTok) sel.innerHTML = '<option>Nessuna stampa trovata</option>';
+      if (ok) onChunkDone(chunk);
     }
   };
-  // 5 carte in parallelo: il limitatore di sfetch tiene comunque il ritmo sotto il limite di Scryfall
-  let next = 0;
-  await Promise.all(Array.from({ length: 5 }, async () => {
-    while (next < names.length && tok === runTok) await loadOne(next++);
-  }));
+
+  // stampa mostrata di default: scelta dell'utente > stampe speciali (Unstable per prima) > più recente nella lingua > anteprima di ripiego
+  const fillTile = i => {
+    const n = names[i], t = tiles[i];
+    if (t.dataset.full) return;
+    const k = front(n), sel = t.querySelector('select'), img = t.querySelector('img');
+    const ch = chosen[n];
+    let c = null;
+    if (ch && (ch.lang === lang || SPECIAL_SETS.has(ch.set))) c = ch;
+    else c = (specialCache[k] || []).slice().sort((a, b) => (b.set === 'ust') - (a.set === 'ust'))[0] || locCache[lang][k] || null;
+    let txt;
+    if (c) { picks[n] = c; txt = label(c); }
+    else if (baseCache[k]) { delete picks[n]; c = baseCache[k]; txt = 'Anteprima EN · la lingua scelta verrà cercata alla generazione'; }
+    else return;
+    if (img.dataset.id !== c.id) { img.src = thumb(c); img.dataset.id = c.id; }
+    sel.innerHTML = ''; const o = document.createElement('option'); o.textContent = txt; sel.appendChild(o);
+    sel.disabled = false;
+  };
+  const fillAll = () => { if (alive()) names.forEach((_, i) => fillTile(i)); };
+  fillAll(); // ciò che è già in cache appare subito
+
+  // 1) stampe speciali (una ricerca ogni 12 carte)
+  const needSp = names.filter(n => !specialDone.has(front(n)));
+  await searchGroup(needSp, '(set:unh or set:und or set:unf or set:ust)', 'include_extras=true&include_variations=true&order=set&dir=asc', 12, 6,
+    c => { if (imgOf(c)) (specialCache[front(c.name)] = specialCache[front(c.name)] || []).push(c); },
+    ch => ch.forEach(n => specialDone.add(front(n))));
+  fillAll();
+  // 2) stampa più recente nella lingua scelta: terre base una per una (hanno centinaia di stampe), le altre a gruppi di 8
+  const needLoc = names.filter(n => !locDone[lang].has(front(n)));
+  const onLoc = c => { if (c.lang !== lang || !imgOf(c)) return; const k = front(c.name); if (!locCache[lang][k]) locCache[lang][k] = c; };
+  const markLoc = ch => ch.forEach(n => locDone[lang].add(front(n)));
+  const locExtra = 'include_multilingual=true&order=released&dir=desc';
+  await searchGroup(needLoc.filter(n => !BASIC.has(n.toLowerCase())), 'lang:' + lang, locExtra, 8, 3, onLoc, markLoc);
+  for (const n of needLoc.filter(n => BASIC.has(n.toLowerCase()))) await searchGroup([n], 'lang:' + lang, locExtra, 1, 1, onLoc, markLoc);
+  fillAll();
+  // 3) carte senza nessuna stampa nella lingua: anteprima di ripiego (stampa predefinita) con la richiesta /cards/collection
+  const missing = names.filter(n => alive() && !locCache[lang][front(n)] && !(specialCache[front(n)] || []).length && !baseCache[front(n)]);
+  if (missing.length) {
+    try {
+      let got = await collection(missing);
+      const rest = missing.filter(n => !got.some(c => matches(c, n)));
+      if (rest.length) got = got.concat(await collection(rest.map(n => n.split('//')[0].trim())));
+      for (const n of missing) { const c = got.find(c => matches(c, n)); if (c && imgOf(c)) { baseCache[front(n)] = c; cname[n] = c.name; } }
+    } catch (e) { log('Errore anteprime: ' + e.message); }
+  }
+  fillAll();
+  if (!alive()) return;
+  tiles.forEach(t => { const s = t.querySelector('select'); if (s.disabled) s.innerHTML = '<option>Nessuna stampa trovata</option>'; });
+  log('Anteprime pronte. Apri il menu di una carta per scegliere un\'altra stampa.');
+
+  // elenco completo delle stampe di una singola carta (una o due richieste, solo su richiesta)
+  async function populate(i) {
+    const n = names[i], t = tiles[i], sel = t.querySelector('select'), img = t.querySelector('img');
+    if (t.dataset.busy) return false;
+    t.dataset.busy = '1';
+    const hadFocus = document.activeElement === sel; // un select disabilitato perde il focus: lo ripristiniamo a fine caricamento
+    let okLoad = false;
+    const prevHtml = sel.innerHTML;
+    sel.disabled = true; sel.innerHTML = '<option>Carico le stampe…</option>';
+    try {
+      const base = '!"' + front0(n) + '"';
+      const search = async L => {
+        const u = API + '?unique=prints&include_multilingual=true&order=released&dir=desc&q=' + encodeURIComponent(base + ' lang:' + L);
+        if (searchCache[u]) return searchCache[u];
+        const r = await sfetch(u, JSONH);
+        if (r.status === 404) return (searchCache[u] = []);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return (searchCache[u] = (await r.json()).data.filter(c => c.lang === L && imgOf(c)));
+      };
+      // stampe nella lingua scelta; se non ce ne sono, ripiega sull'inglese. Se la lista non è inglese, in fondo vanno 2 stampe inglesi (le più recenti)
+      let data = await search(lang);
+      if (lang !== 'en') { const en = await search('en'); data = data.length ? [...data, ...en.slice(0, 2)] : en; }
+      const sp = (specialCache[front(n)] || []).slice().sort((a, b) => (b.set === 'ust') - (a.set === 'ust'));
+      if (sp.length) data = [...sp, ...data.filter(x => !sp.some(s => s.id === x.id))];
+      if (!data.length) throw new Error('vuoto');
+      sel.innerHTML = '';
+      data.forEach((c, k) => { const o = document.createElement('option'); o.value = k; o.textContent = label(c); sel.appendChild(o); });
+      const cur = picks[n] ? data.findIndex(c => c.id === picks[n].id) : -1;
+      const d = cur >= 0 ? cur : 0;
+      sel.value = d; picks[n] = data[d]; img.src = thumb(data[d]); img.dataset.id = data[d].id;
+      sel.onchange = () => { picks[n] = data[+sel.value]; chosen[n] = picks[n]; img.src = thumb(picks[n]); img.dataset.id = picks[n].id; };
+      t.dataset.full = '1';
+      okLoad = true;
+    } catch (e) {
+      sel.innerHTML = prevHtml;
+      log('Impossibile caricare le stampe di ' + n + ': ' + e.message);
+    }
+    sel.disabled = false;
+    delete t.dataset.busy;
+    if (okLoad && hadFocus) sel.focus();
+    return okLoad;
+  }
 }
 
 const front = n => n.split('//')[0].trim().toLowerCase();
